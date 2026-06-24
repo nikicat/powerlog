@@ -120,3 +120,7 @@ they're documented here because they're easy to misread:
 
 Portable to most Intel laptops; the machine-specific notes above only affect the
 interpretation of `psys` and `bl`.
+
+## License
+
+[MIT](LICENSE) © Nikolay Bryskin
