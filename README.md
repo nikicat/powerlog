@@ -1,4 +1,4 @@
-# powerstat
+# powerlog
 
 A single-file Bash tool that shows **CPU power / thermal / charging / clock / load**
 state on Linux laptops — as a one-shot report or a live one-line-per-second table.
@@ -7,13 +7,13 @@ It pulls everything from `sysfs`, `turbostat`, `rdmsr` and the battery gauge, an
 focuses on telling you *why* the CPU is doing what it's doing (which power/thermal
 limit is active, what the real effective clock is, where the watts are going).
 
-> Not related to Colin King's `powerstat` — just a personal tool that grew out of
-> chasing down why a Dell XPS 13 throttled. See [Notes](#notes--caveats).
+> A small personal tool that grew out of chasing down why a Dell XPS 13 kept
+> throttling. See [Notes](#notes--caveats).
 
 ## Example
 
 ```
-$ sudo powerstat -w 1
+$ sudo powerlog -w 1
 TIME         MHz busy   pkgW   psys   sysW  restW  pkgT   fan   bl  chgW  SOURCE bat% mode   LIMITER  thr+
 22:31:10    1547  12%   4.39    5.1    n/a    n/a   51°C  6096  55%    45  AC     100% bal    none        0
 22:31:12    2790  31%   9.88    7.4    n/a    n/a   71°C  6105  55%    45  AC     100% perf   PWR         0
@@ -21,7 +21,7 @@ TIME         MHz busy   pkgW   psys   sysW  restW  pkgT   fan   bl  chgW  SOURCE
 ```
 
 ```
-$ sudo powerstat            # one-shot detailed report
+$ sudo powerlog            # one-shot detailed report
 ===== POWER / CHARGING =====
   source        : AC
   battery       : 100%  flow +0.0W  (+charge / -discharge)
@@ -37,9 +37,9 @@ $ sudo powerstat            # one-shot detailed report
 ## Usage
 
 ```
-powerstat              one-shot detailed report (sections, self-labeled)
-powerstat -w [SEC]     periodic: one summary line every SEC seconds (default 1)
-powerstat -h           help, including a description of every column
+powerlog              one-shot detailed report (sections, self-labeled)
+powerlog -w [SEC]     periodic: one summary line every SEC seconds (default 1)
+powerlog -h           help, including a description of every column
 ```
 
 ## Columns (periodic mode)
@@ -78,7 +78,7 @@ cumulative throttle counts, governor/EPP/base-max clocks, and the top CPU consum
 Effective MHz, package watts and the limiter reason read MSRs/RAPL, which need root:
 
 ```bash
-sudo powerstat -w
+sudo powerlog -w
 ```
 
 To run **without** sudo, grant the two binaries the capability and relax MSR access:
@@ -93,7 +93,7 @@ sudo groupadd -f msr && sudo usermod -aG msr "$USER" && echo msr | sudo tee /etc
 ## Install
 
 ```bash
-install -Dm755 powerstat ~/.local/bin/powerstat
+install -Dm755 powerlog ~/.local/bin/powerlog
 ```
 
 ## Notes & caveats

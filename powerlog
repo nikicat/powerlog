@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# powerstat — show CPU power / thermal / charging / clock / load state.
-#   powerstat            one-shot detailed report
-#   powerstat -w [SEC]   periodic: one summary line every SEC seconds (default 1)
+# powerlog — show CPU power / thermal / charging / clock / load state.
+#   powerlog            one-shot detailed report
+#   powerlog -w [SEC]   periodic: one summary line every SEC seconds (default 1)
 # Richer data (effective MHz, package watts, throttle reason) reads MSRs/RAPL,
-# which need privilege: run as root (sudo ./powerstat.sh), or grant the binaries
+# which need privilege: run as root (sudo ./powerlog.sh), or grant the binaries
 # CAP_SYS_RAWIO + an msr-group udev rule. Without it the script degrades:
 # falls back to requested freq and omits package watts / throttle reason.
 set -u
@@ -227,16 +227,16 @@ periodic() {
 
 usage() {
   cat <<'EOF'
-powerstat — CPU power / thermal / charging / clock / load at a glance.
+powerlog — CPU power / thermal / charging / clock / load at a glance.
 
 USAGE
-  powerstat              one-shot detailed report (sections, self-labeled)
-  powerstat -w [SEC]     periodic: one summary line every SEC seconds (default 1)
-  powerstat -h           this help
+  powerlog              one-shot detailed report (sections, self-labeled)
+  powerlog -w [SEC]     periodic: one summary line every SEC seconds (default 1)
+  powerlog -h           this help
 
 PRIVILEGE
   Effective MHz, package watts and the limiter reason read MSRs/RAPL, which
-  need root: run `sudo powerstat ...`, or grant CAP_SYS_RAWIO to turbostat/rdmsr
+  need root: run `sudo powerlog ...`, or grant CAP_SYS_RAWIO to turbostat/rdmsr
   plus an msr-group udev rule. Without it those columns show n/a / ? and MHz
   falls back to the requested (not effective) frequency.
 
