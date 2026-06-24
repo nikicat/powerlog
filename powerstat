@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# powerstat — show CPU power / thermal / charging / clock / load state.
+#   powerstat            one-shot detailed report
+#   powerstat -w [SEC]   periodic: one summary line every SEC seconds (default 1)
+# Richer data (effective MHz, package watts, throttle reason) reads MSRs/RAPL,
+# which need privilege: run as root (sudo ./powerstat.sh), or grant the binaries
+# CAP_SYS_RAWIO + an msr-group udev rule. Without it the script degrades:
+# falls back to requested freq and omits package watts / throttle reason.
+set -u
+
+have() { command -v "$1" >/dev/null 2>&1; }
+ts_ok() { have turbostat; }   # falls back if it yields no data (no privilege)
+
+# ---- small readers ----------------------------------------------------------
+r()  { cat "$1" 2>/dev/null; }                    # raw file
+ri() { local v; v=$(r "$1"); echo "${v:-0}"; }    # int, 0 if missing
+zone_temp() { awk '{printf "%d", $1/1000}' "$1" 2>/dev/null; }
+
+# Average effective MHz + package watts via turbostat (1s window). Sets MHZ/W/TJ.
+sample_turbostat() {
+  MHZ=""; PKGW=""; BUSY=""; PKGT=""; PSYSW="n/a"
+  ts_ok || return 1
+  local row
+  row=$(turbostat --quiet --show Busy%,Bzy_MHz,PkgTmp,PkgWatt,SysWatt \
+        --interval "${1:-1}" --num_iterations 1 2>/dev/null \
+        | awk 'NR>1 && NF>=4 {print $1, $2, $3, $4, (NF>=5?$5:"n/a"); exit}')
+  [ -n "$row" ] && read -r BUSY MHZ PKGT PKGW PSYSW <<<"$row"
+  [ -n "$MHZ" ]
+}
+
+# Per-core busy% over an interval (no root). Sets BUSY (system avg).
+sample_busy() {
+  local s=$1 a b
+  a=$(grep '^cpu ' /proc/stat)
+  sleep "$s"
+  b=$(grep '^cpu ' /proc/stat)
+  BUSY=$(awk -v A="$a" -v B="$b" 'BEGIN{
+    split(A,x); split(B,y);
+    ib=x[5]+x[6]; tb=0; for(i=2;i<=11;i++)tb+=x[i];
+    ie=y[5]+y[6]; te=0; for(i=2;i<=11;i++)te+=y[i];
+    printf "%.0f",(1-(ie-ib)/(te-tb))*100 }')
+}
+
+# Decode IA32_PACKAGE_THERM_STATUS (0x1b1). Sets LIMIT and TJDELTA.
+sample_msr() {
+  LIMIT="?"; TJDELTA=""
+  have rdmsr || return 1
+  local hex dec; hex=$(rdmsr -X 0x1b1 2>/dev/null | head -1) || return 1
+  [ -n "$hex" ] || return 1
+  dec=$((16#$hex))
+  local t=""
+  (( dec & 1 ))        && t+="THERM,"
+  (( dec & (1<<2) ))   && t+="PROCHOT,"
+  (( dec & (1<<10) ))  && t+="PWR,"
+  LIMIT="${t%,}"; [ -z "$LIMIT" ] && LIMIT="none"
+  TJDELTA=$(( (dec>>16) & 0x7f ))     # degrees below Tjmax
+}
+
+# Charging summary. Sets SRC, BATPCT, BATFLOW (signed W, + = charging),
+# and CHGW (charger PD-contract watts of the online source, "-" if on battery).
+sample_power() {
+  SRC="?"; BATPCT=""; BATFLOW=""; CHGW="-"; BATW=""
+  local ac=0 p w
+  for p in /sys/class/power_supply/*; do
+    case "$(r "$p/type")" in Mains|USB) ;; *) continue ;; esac
+    [ "$(r "$p/online")" = "1" ] || continue
+    ac=1
+    # negotiated PD contract = current_now * voltage_now (Mains nodes lack these → 0)
+    w=$(awk -v c="$(ri "$p/current_now")" -v v="$(ri "$p/voltage_now")" \
+        'BEGIN{x=c*v/1e12; if(x>0.5) printf "%.0f", x}')
+    [ -n "$w" ] && CHGW="$w"
+  done
+  if [ -d /sys/class/power_supply/BAT0 ]; then
+    BATPCT=$(ri /sys/class/power_supply/BAT0/capacity)
+    local st; st=$(r /sys/class/power_supply/BAT0/status)
+    local pw cn vn
+    pw=$(ri /sys/class/power_supply/BAT0/power_now)
+    if [ "$pw" = 0 ]; then
+      cn=$(ri /sys/class/power_supply/BAT0/current_now); vn=$(ri /sys/class/power_supply/BAT0/voltage_now)
+      pw=$(awk -v c="$cn" -v v="$vn" 'BEGIN{printf "%.0f", c*v/1e6}')
+    fi
+    BATFLOW=$(awk -v p="$pw" -v s="$st" 'BEGIN{w=p/1e6; printf "%+.1f", (s=="Discharging"?-w:w)}')
+    BATW=$(awk -v p="$pw" 'BEGIN{printf "%.1f", p/1e6}')   # battery draw magnitude (W)
+    SRC=$([ "$ac" = 1 ] && echo "AC" || echo "BATT")
+  fi
+}
+
+# Current platform power profile (the "power mode" in OS settings). Sets MODE.
+sample_mode() {
+  local m; m=$(r /sys/firmware/acpi/platform_profile)
+  case "$m" in
+    performance)          MODE=perf  ;;
+    balanced-performance) MODE=balprf ;;
+    balanced)             MODE=bal   ;;
+    low-power)            MODE=lowpwr ;;
+    "")                   MODE="-"   ;;
+    *)                    MODE=$m    ;;   # cool, quiet, … shown verbatim
+  esac
+}
+
+# Backlight % (sysfs actual_brightness) and max fan RPM (hwmon). Sets BL and FAN.
+# World-readable, no sudo. bl is accurate when Mutter drives the LED via its sysfs
+# backend (HDR off). In HDR/ref-white mode Mutter pins the LED at max and dims via the
+# GPU color pipeline, so this reads ~100% regardless — a known XPS-in-HDR caveat.
+sample_aux() {
+  BL="-"; FAN="-"
+  local d b m f rpm best=0
+  for d in /sys/class/backlight/*; do
+    [ -e "$d/actual_brightness" ] || continue
+    b=$(ri "$d/actual_brightness"); m=$(ri "$d/max_brightness")
+    [ "${m:-0}" -gt 0 ] 2>/dev/null && BL="$(awk -v b="$b" -v m="$m" 'BEGIN{printf "%d%%", b*100/m}')"
+    break
+  done
+  for f in /sys/class/hwmon/hwmon*/fan*_input; do
+    [ -e "$f" ] || continue
+    rpm=$(ri "$f"); [ "${rpm:-0}" -gt "$best" ] 2>/dev/null && best=$rpm
+  done
+  [ "$best" -gt 0 ] 2>/dev/null && FAN="$best"
+}
+
+# Locate the psys (whole-platform) RAPL energy counter, once. read_psys emits µJ.
+PSYS_DIR=""
+for d in /sys/class/powercap/intel-rapl:*; do
+  [ "$(r "$d/name")" = "psys" ] && { PSYS_DIR="$d"; break; }
+done
+PSYS_MAX=$(ri "$PSYS_DIR/max_energy_range_uj")
+read_psys() { [ -n "$PSYS_DIR" ] && cat "$PSYS_DIR/energy_uj" 2>/dev/null; }
+
+# ---- charger (USB-C PD) capability, one-shot only ---------------------------
+print_charger() {
+  local p w
+  for p in /sys/class/power_supply/*; do
+    [ "$(r "$p/online")" = "1" ] || continue
+    [ "$(r "$p/type")" = "USB" ] || [ "$(r "$p/type")" = "Mains" ] || continue
+    w=$(awk -v c="$(ri $p/current_now)" -v v="$(ri $p/voltage_now)" 'BEGIN{x=c*v/1e12; if(x>0)printf "%.0fW",x}')
+    printf "  %-28s online=1 %s\n" "$(basename "$p")" "$w"
+  done
+}
+
+# ============================================================================
+one_shot() {
+  local e0 e1
+  echo "===== POWER / CHARGING ====="
+  sample_power
+  echo "  source        : $SRC"
+  [ -n "$BATPCT" ] && echo "  battery       : ${BATPCT}%  flow ${BATFLOW}W  (+charge / -discharge)"
+  print_charger
+  if [ -n "$PSYS_DIR" ]; then
+    e0=$(read_psys); sleep 1; e1=$(read_psys)
+    awk -v a="$e0" -v b="$e1" -v mx="$PSYS_MAX" 'BEGIN{de=b-a; if(de<0)de+=mx;
+      printf "  platform(psys): %.1f W  (whole board: cpu + display + ssd + usb + fans + …)\n", de/1e6}'
+  fi
+  echo "  RAPL limits   :"
+  local d
+  for d in /sys/class/powercap/intel-rapl:0; do
+    [ -d "$d" ] || continue
+    awk -v f="$d" 'BEGIN{
+      cmd="cat "f"/constraint_0_power_limit_uw"; cmd|getline pl1; close(cmd);
+      cmd="cat "f"/constraint_1_power_limit_uw"; cmd|getline pl2; close(cmd);
+      printf "    PL1=%.0fW  PL2=%.0fW\n", pl1/1e6, pl2/1e6 }'
+  done
+
+  echo "===== CLOCK ====="
+  sample_mode
+  echo "  power mode    : $(r /sys/firmware/acpi/platform_profile)  (choices: $(r /sys/firmware/acpi/platform_profile_choices))"
+  echo "  driver/gov    : $(r /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver) / $(r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+  echo "  EPP           : $(r /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
+  awk 'BEGIN{
+    cmd="cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency"; cmd|getline b; close(cmd);
+    cmd="cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"; cmd|getline mx; close(cmd);
+    cmd="cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq"; cmd|getline mn; close(cmd);
+    printf "  freq          : base %.1f  min %.1f  max %.1f GHz\n", b/1e6, mn/1e6, mx/1e6 }'
+  [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] && \
+    echo "  turbo         : $([ "$(r /sys/devices/system/cpu/intel_pstate/no_turbo)" = 0 ] && echo on || echo OFF)"
+  if sample_turbostat 1; then
+    echo "  effective     : ${MHZ} MHz  (busy ${BUSY}%, pkg ${PKGW}W)"
+  else
+    echo "  scaling_cur   : $(awk '{s+=$1;n++}END{printf "%.0f MHz (requested, avg)",s/n/1000}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq)"
+  fi
+
+  echo "===== THERMAL ====="
+  local z
+  for z in /sys/class/thermal/thermal_zone*; do
+    printf "  %-14s: %s°C\n" "$(r "$z/type")" "$(zone_temp "$z/temp")"
+  done
+  echo "  throttle (cumulative since boot):"
+  echo "    core   : $(ri /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count)"
+  echo "    package: $(ri /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count)"
+  if sample_msr; then
+    echo "  limiter (MSR) : $LIMIT   (${TJDELTA}°C below Tjmax)"
+  fi
+  sample_aux
+  echo "  backlight     : $BL    fan(max rpm): $FAN"
+
+  echo "===== LOAD ====="
+  echo "  loadavg       : $(cut -d' ' -f1-3 /proc/loadavg)  (cpus: $(nproc))"
+  echo "  top cpu       :"
+  ps -eo comm,%cpu --sort=-%cpu --no-headers | grep -v '^ps ' | head -3 | sed 's/^/    /'
+}
+
+# ============================================================================
+periodic() {
+  local intv=${1:-1} prev_thr cur_thr
+  prev_thr=$(ri /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count)
+  printf "%-8s %7s %4s %6s %6s %6s %6s %5s %5s %4s %5s  %-6s %4s %-6s %-12s %5s\n" \
+    TIME MHz busy pkgW psys sysW restW pkgT fan bl chgW SOURCE bat% mode LIMITER thr+
+  while :; do
+    if ! sample_turbostat "$intv"; then sample_busy "$intv"; MHZ="n/a"; PKGW="n/a"; PKGT="n/a"; fi
+    sample_power; sample_mode; sample_aux; sample_msr
+    # psys: raw RAPL psys (from turbostat, same window). Uncalibrated on this XPS
+    # (~= package, not whole-system) — shown for completeness, NOT used in restW.
+    # sysW: true whole-system power, which only the battery exposes (discharge =
+    # current*voltage). On AC there's no honest whole-system sensor here -> n/a.
+    if [ "$SRC" = "BATT" ] && [[ "${BATW:-}" =~ ^[0-9.]+$ ]]; then SYSW="$BATW"; else SYSW="n/a"; fi
+    if [[ "$SYSW" =~ ^[0-9.]+$ ]] && [[ "$PKGW" =~ ^[0-9.]+$ ]]; then
+      RESTW=$(awk -v s="$SYSW" -v k="$PKGW" 'BEGIN{r=s-k; if(r<0.05) print "n/a"; else printf "%.1f", r}')
+    else RESTW="n/a"; fi
+    BUSYI=$(awk -v b="${BUSY:-}" 'BEGIN{if(b ~ /^[0-9.]+$/) printf "%d", b+0.5; else print "?"}')
+    cur_thr=$(ri /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count)
+    printf "%-8s %7s %3s%% %6s %6s %6s %6s %4s°C %5s %4s %5s  %-6s %3s%% %-6s %-12s %5s\n" \
+      "$(date +%H:%M:%S)" "$MHZ" "$BUSYI" "$PKGW" "$PSYSW" "$SYSW" "$RESTW" "$PKGT" "$FAN" "$BL" "$CHGW" \
+      "$SRC" "${BATPCT:-?}" "${MODE:-?}" "${LIMIT:-?}" "$((cur_thr - prev_thr))"
+    prev_thr=$cur_thr
+    # turbostat/sleep already consumed ~intv seconds (the psys window)
+  done
+}
+
+usage() {
+  cat <<'EOF'
+powerstat — CPU power / thermal / charging / clock / load at a glance.
+
+USAGE
+  powerstat              one-shot detailed report (sections, self-labeled)
+  powerstat -w [SEC]     periodic: one summary line every SEC seconds (default 1)
+  powerstat -h           this help
+
+PRIVILEGE
+  Effective MHz, package watts and the limiter reason read MSRs/RAPL, which
+  need root: run `sudo powerstat ...`, or grant CAP_SYS_RAWIO to turbostat/rdmsr
+  plus an msr-group udev rule. Without it those columns show n/a / ? and MHz
+  falls back to the requested (not effective) frequency.
+
+PERIODIC COLUMNS
+  TIME      wall-clock time (HH:MM:SS)
+  MHz       effective core frequency, busy-averaged (turbostat Bzy_MHz); n/a w/o root
+  busy      mean CPU utilization across all cores (%)
+  pkgW      CPU package power draw, RAPL (W); n/a w/o root
+  psys      raw RAPL psys domain (W). Uncalibrated on this XPS (~= or below package,
+            not whole-system) — shown for completeness, NOT used in restW.
+  sysW      true whole-system power from battery discharge (W); n/a on AC.
+  restW     sysW - pkgW: non-CPU system power (display+ssd+board+…); battery only.
+  pkgT      package temperature (°C)
+  fan       fastest fan speed (RPM); "-" if no hwmon fan
+  bl        backlight % (sysfs actual_brightness/max). Live when Mutter uses the
+            sysfs LED backend (HDR off); reads ~100% in HDR/ref-white mode.
+  chgW      charger PD-contract watts offered by the online adapter; "-" on battery
+  SOURCE    power source: AC (plugged) or BATT (on battery)
+  bat%      battery charge level (%)
+  mode      OS power profile (/sys/firmware/acpi/platform_profile):
+            perf, bal, lowpwr, balprf, cool, quiet, …
+  LIMITER   active perf cap from MSR 0x1b1: PWR=power, THERM=Tjmax,
+            PROCHOT=external assert, none; "?" w/o root
+  thr+      package thermal-throttle events since the previous line (delta)
+EOF
+}
+
+# ---- dispatch ---------------------------------------------------------------
+case "${1:-}" in
+  -w|--watch) shift; periodic "${1:-1}" ;;
+  -h|--help)  usage ;;
+  *)          one_shot ;;
+esac
